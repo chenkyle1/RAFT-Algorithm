@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os
+import random
+import time
+
+BROADCAST = "FFFF"
+CANDIDATE = "candidate"
+LEADER = "leader"
+FOLLOWER = "follower"
+PUT = "put"
+GET = "get"
+REDIRECT = "redirect"
+VOTE_REQUEST = "vote_request"
+VOTE_RESPONSE = "vote_response"
+APPEND_ENTRY = "append_entry"
+FAIL = "fail"
+SRC = "src"
+DST = "dst"
+TYPE = "type"
+TERM = "term"
+MID = "MID"
+VALUE = "value"
+KEY = "key"
+COMMIT_INDEX = "commit_index"
+LOG = "log"
+PREV_LOG = "log"
+INDEX = "index"
+VOTE = "vote"
+YES = "yes"
+NO = "no"
+APPEND_ACCEPT = "append_accept"
+APPEND_REJECT = "append_reject"
+COMMIT = "commit"
+COMMIT_OK = "commit_ok"
+COMMIT_LOG = "commit_log"
+APPEND_COMMIT = "append_commit"
+LEADER_INDEX = "leader_index"
+COMMIT_APPROVED = "commit_approved"
+
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        self.leader = BROADCAST
+        self.state = FOLLOWER
+        self.term = 0
+        self.votes = 0
+        self.voted = False
+        self.majority = math.floor((len(self.others) + 1) / 2) + 1
+        self.state_machine = {}
+
+        self.timeout = 3
+        self.timeout_time = time.time() + self.timeout
+        if id == "0000":
+            self.timeout_time = time.time()
+
+        self.log = []
+        self.index = -1
+        self.commit_votes = 0
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        # print("Replica %s starting up" % self.id, flush=True)
+        hello = {SRC: self.id, DST: BROADCAST, LEADER: BROADCAST, TYPE: "hello"}
+        self.send(hello)
+        # print("Sent hello message: %s" % hello, flush=True)
+
+    # sends a message
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    # gets a random election timeout
+    def get_election_timeout(self):
+        return random.uniform(0.15, 0.3)
+
+    # sends a heartbeat
+    def send_heartbeat(self):
+        if self.index < len(self.log) - 1:
+            message = {SRC: self.id, DST: BROADCAST, LEADER: self.id, TYPE: APPEND_ENTRY,
+                       MID: self.log[self.index + 1][MID],
+                       LOG: self.log[self.index + 1],
+                       PREV_LOG: self.log[self.index],
+                       VALUE: None}
+        else:
+            message = {SRC: self.id, DST: BROADCAST, LEADER: self.id, TYPE: APPEND_ENTRY, VALUE: None}
+        self.send(message)
+
+    # starts an election
+    def start_election(self):
+        self.state = CANDIDATE
+        self.term += 1
+        self.votes = 0
+        self.timeout = self.get_election_timeout()
+        self.timeout_time = time.time() + self.timeout
+        message = {SRC: self.id, DST: BROADCAST, LEADER: self.id, TYPE: VOTE_REQUEST, TERM: self.term, MID: "",
+                   COMMIT_INDEX: self.index}
+        self.send(message)
+
+    # checks if a heartbeat should sent or election started
+    def check_timer(self):
+        if time.time() > self.timeout_time and self.state == LEADER:
+            self.send_heartbeat()
+        elif time.time() > self.timeout_time and self.state != LEADER:
+            self.start_election()
+
+    # commits a message
+    def perform_commit(self, msg):
+        self.index += 1
+        self.state_machine[msg[KEY]] = msg[VALUE]
+        message = {SRC: self.id, DST: BROADCAST, LEADER: self.id, TYPE: COMMIT_APPROVED, MID: msg[MID],
+                   COMMIT_INDEX: self.index}
+        self.send(message)
+
+    # handles leader messages
+    def handle_leader(self, msg):
+        # put
+        if msg[TYPE] == PUT:
+            key = msg[KEY]
+            value = msg[VALUE]
+            self.state_machine[key] = value
+            entry = {KEY: msg[KEY], VALUE: msg[VALUE], TERM: self.term, INDEX: len(self.log), "MID": msg["MID"]}
+            self.log.append(entry)
+            message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: "ok", "MID": msg["MID"]}
+            self.send(message)
+
+        # get
+        if msg[TYPE] == GET:
+            if msg[KEY] in self.state_machine:
+                message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: "ok", "MID": msg["MID"],
+                           VALUE: self.state_machine[msg[KEY]]}
+            else:
+                message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: FAIL, "MID": msg["MID"]}
+            self.send(message)
+
+        # vote request
+        if msg[TYPE] == VOTE_REQUEST:
+            self.handle_vote_request(msg)
+
+        # append accept
+        if msg[TYPE] == APPEND_ACCEPT:
+            self.commit_votes += 1
+            if self.commit_votes > self.majority:
+                self.perform_commit(msg)
+                self.commit_votes = 0
+
+        # append reject
+        if msg[TYPE] == APPEND_REJECT:
+            commit_index = msg[COMMIT_INDEX]
+            log = self.log[commit_index + 1]
+            mid = self.log[commit_index + 1][MID]
+            message = {SRC: self.id, DST: msg[SRC], LEADER: self.id, TYPE: APPEND_COMMIT, MID: mid,
+                       COMMIT_LOG: log, LEADER_INDEX: self.index}
+            self.send(message)
+
+    # handles append entry for followers
+    def handle_follower_append(self, msg):
+        log = msg[LOG]
+        prev = msg[PREV_LOG]
+
+        if prev[INDEX] == -1 or prev[INDEX] == self.index:
+            del self.log[prev[INDEX] + 1:]
+            self.log.append(log)
+        #     message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: APPEND_ACCEPT, MID: msg[MID]}
+        # else:
+        #     message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: APPEND_REJECT, MID: msg[MID],
+        #                COMMIT_INDEX: self.index}
+        # self.send(message)
+
+    # handles get and get messages for followers and candidates
+    def handle_get_put(self, msg):
+        message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: REDIRECT, MID: msg[MID]}
+        self.send(message)
+
+    # handles follower messages
+    def handle_follower(self, msg):
+        # get or put
+        if msg[TYPE] == GET or msg[TYPE] == PUT:
+            self.handle_get_put(msg)
+
+        # vote request
+        if msg[TYPE] == VOTE_REQUEST:
+            self.handle_vote_request(msg)
+
+        # append entry
+        if msg[TYPE] == APPEND_ENTRY:
+            self.leader = msg[SRC]
+            self.timeout_time = time.time() + self.timeout
+            if LOG in msg:
+                self.handle_follower_append(msg)
+
+        # appends a commit
+        if msg[TYPE] == APPEND_COMMIT:
+            self.leader = msg[SRC]
+            self.timeout_time = time.time() + self.timeout
+            commit_log = msg[COMMIT_LOG]
+            del self.log[self.index + 1:]
+            self.log.append(commit_log)
+            self.state_machine[commit_log[KEY]] = commit_log[VALUE]
+            self.index += 1
+            # if msg[LEADER_INDEX] > self.index:
+            #     message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: APPEND_REJECT, MID: msg[MID],
+            #                COMMIT_INDEX: self.index}
+            #     self.send(message)
+
+        # commit approved
+        if msg[TYPE] == COMMIT_APPROVED:
+            if self.index == msg[COMMIT_INDEX] - 1:
+                self.index += 1
+                log = self.log[self.index]
+                self.state_machine[log[KEY]] = log[VALUE]
+
+    # handles candidate messages
+    def handle_candidate(self, msg):
+        # put or get
+        if msg[TYPE] == GET or msg[TYPE] == PUT:
+            self.handle_get_put(msg)
+
+        # vote request
+        if msg[TYPE] == VOTE_REQUEST:
+            self.handle_vote_request(msg)
+
+        # vote response
+        if msg[TYPE] == VOTE_RESPONSE:
+            if msg[VOTE] == YES:
+                self.votes += 1
+                if self.votes > (len(self.others) + 1) // 2:
+                    self.leader = self.id
+                    self.state = LEADER
+                    message = {SRC: self.id, DST: BROADCAST, LEADER: self.id, TYPE: APPEND_ENTRY, VALUE: None}
+                    self.send(message)
+
+        # append entry
+        if msg[TYPE] == APPEND_ENTRY:
+            self.state = FOLLOWER
+            self.handle_follower(msg)
+
+    def handle_vote_request(self, msg):
+        if msg[TERM] > self.term:
+            self.state = FOLLOWER
+            self.term = msg[TERM]
+            self.voted = False
+        if msg[COMMIT_INDEX] >= self.index and self.voted is False:
+            message = {SRC: self.id, DST: msg[SRC], LEADER: msg[SRC], TYPE: VOTE_RESPONSE, TERM: self.term,
+                       VOTE: YES}
+            self.voted = True
+        else:
+            message = {SRC: self.id, DST: msg[SRC], LEADER: self.leader, TYPE: VOTE_RESPONSE, TERM: self.term,
+                       VOTE: NO}
+        self.send(message)
+
+    # handles a message depending on the state
+    def handle_msg(self, msg):
+        if self.state == LEADER:
+            self.handle_leader(msg)
+        elif self.state == FOLLOWER:
+            self.handle_follower(msg)
+        else:
+            self.handle_candidate(msg)
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [], 1)[0]
+            self.check_timer()
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+                msg = data.decode('utf-8')
+                # print("Received message '%s'" % (msg,), flush=True)
+                msg = json.loads(msg)
+                self.handle_msg(msg)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
